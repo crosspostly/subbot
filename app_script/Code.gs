@@ -38,7 +38,9 @@ const DEFAULT_CONFIG = {
     sub_warning_text_no_link: "{user_mention}, чтобы отправлять сообщения в этот чат, вы должны быть подписаны на наш канал.",
     sub_success_text: "🎉 {user_mention}, вы успешно подписались и теперь можете писать сообщения!",
     sub_fail_text: "🚫 {user_mention}, не удалось подтвердить вашу подписку. Убедитесь, что подписаны на все каналы, и попробуйте снова.",
-    sub_mute_text: "{user_mention}, вы были временно ограничены в отправке сообщений на {duration} минут, так как не подписались на обязательные каналы."
+    sub_mute_text: "{user_mention}, вы были временно ограничены в отправке сообщений на {duration} минут, так как не подписались на обязательные каналы.",
+    forward_warning_text: "{user_mention}, в этом чате запрещены репосты из других каналов/чатов. Ваше сообщение удалено.",
+    forward_mute_text: "{user_mention}, вы были ограничены на {duration} минут за нарушение правил репостов."
   }
 };
 
@@ -74,6 +76,69 @@ function getChatMemberSafe(chatId, userId) {
   } catch (e) {
     return null;
   }
+}
+
+/**
+ * ♻️ НОВЫЙ HELPER: Проверяет, ограничен ли пользователь в данный момент
+ * @param {string} chatId - ID чата
+ * @param {string|number} userId - ID пользователя
+ * @returns {boolean} - true если пользователь ограничен
+ */
+function isUserCurrentlyRestricted(chatId, userId) {
+  try {
+    const member = getChatMemberSafe(chatId, userId);
+    const until = member?.result?.until_date ? Number(member.result.until_date) : 0;
+    const now = Math.floor(Date.now() / 1000);
+    const isRestricted = String(member?.result?.status || '') === 'restricted' || member?.result?.can_send_messages === false;
+    return isRestricted && until > now;
+  } catch (e) { 
+    return false; 
+  }
+}
+
+/**
+ * ♻️ НОВЫЙ HELPER: Генерирует клавиатуру подписки с кнопками
+ * @param {object} config - Объект конфигурации
+ * @param {string|number} userId - ID пользователя
+ * @returns {object} - { keyboard, channelLink, channelTitle }
+ */
+function buildSubscriptionKeyboard(config, userId) {
+  if (!config.target_channel_url || !config.target_channel_url.trim()) {
+    return {
+      keyboard: { 
+        inline_keyboard: [[{ 
+          text: "✅ Я подписался", 
+          callback_data: `check_sub_${userId}` 
+        }]] 
+      },
+      channelLink: null,
+      channelTitle: null
+    };
+  }
+
+  let channelTitle = String(config.target_channel_id);
+  try {
+    const channelInfo = sendTelegram('getChat', { chat_id: config.target_channel_id });
+    if (channelInfo?.result?.title) {
+      channelTitle = channelInfo.result.title;
+    }
+  } catch (e) {
+    logToSheet('WARN', `Failed to get channel info: ${e.message}`);
+  }
+
+  const safeTitle = String(channelTitle).replace(/[<>]/g, '');
+  const channelLink = `<a href="${config.target_channel_url}">${safeTitle}</a>`;
+
+  return {
+    keyboard: {
+      inline_keyboard: [
+        [{ text: `📱 ${safeTitle}`, url: config.target_channel_url }],
+        [{ text: "✅ Я подписался", callback_data: `check_sub_${userId}` }]
+      ]
+    },
+    channelLink,
+    channelTitle: safeTitle
+  };
 }
 
 /**
@@ -116,7 +181,6 @@ function onOpen() {
     .addItem('🔎 Проверить вебхук', 'userCheckWebhook')
     .addItem('♻️ Сбросить вебхук (очистить очередь)', 'userResetWebhook')
     .addSeparator()
-    .addItem('🧪 Запустить тесты', 'runTestsFromMenu')
     .addItem('🔄 Сбросить кэш (Настройки и Админы)', 'userClearCache')
     .addToUi();
 }
@@ -418,7 +482,9 @@ function _createSheets() {
         ["mute_level_1_duration_min", 60, "Длительность мута за первое нарушение."],
         ["mute_level_2_duration_min", 1440, "Длительность мута за второе нарушение (24 часа)."],
         ["mute_level_3_duration_min", 10080, "Длительность мута за третье и последующие нарушения (7 дней)."],
-        ["combined_mute_notice", true, "Отправлять объединённое сообщение (мут + инструкция по подписке)"]
+        ["combined_mute_notice", true, "Отправлять объединённое сообщение (мут + инструкция по подписке)"],
+        ["forward_check_enabled", true, "TRUE/FALSE. Проверять и удалять репосты из неразрешённых источников."],
+        ["forward_violation_limit", 3, "Сколько репостов может отправить пользователь перед мутом."]
     ],
     "Texts": [
         ["key", "value"],
@@ -427,7 +493,9 @@ function _createSheets() {
         ["sub_warning_text_no_link", DEFAULT_CONFIG.texts.sub_warning_text_no_link],
         ["sub_success_text", DEFAULT_CONFIG.texts.sub_success_text],
         ["sub_fail_text", DEFAULT_CONFIG.texts.sub_fail_text],
-        ["sub_mute_text", DEFAULT_CONFIG.texts.sub_mute_text]
+        ["sub_mute_text", DEFAULT_CONFIG.texts.sub_mute_text],
+        ["forward_warning_text", DEFAULT_CONFIG.texts.forward_warning_text],
+        ["forward_mute_text", DEFAULT_CONFIG.texts.forward_mute_text]
     ],
     "Users": [["user_id", "mute_level", "first_violation_date"]],
     "Logs": [["Timestamp", "Level", "Message"]],
@@ -1135,52 +1203,33 @@ function handleCallbackQuery(callbackQuery, services, config) {
         } else {
             // ✅ ПОЛЬЗОВАТЕЛЬ НЕ ПОДПИСАН - РЕДАКТИРУЕМ СТАРОЕ СООБЩЕНИЕ
             
-            if (config.target_channel_url && config.target_channel_url.trim() !== '') {
-                let channelTitle = config.target_channel_id;
-                try {
-                    const channelInfo = sendTelegram('getChat', { chat_id: config.target_channel_id });
-                    channelTitle = channelInfo?.result?.title || config.target_channel_id;
-                } catch (e) {
-                    logToSheet('WARN', `Failed to get channel info for ${config.target_channel_id}: ${e.message}`);
-                }
-                
-                const channelLink = `<a href="${config.target_channel_url}">${channelTitle.replace(/[<>]/g, '')}</a>`;
+            // ♻️ ИСПОЛЬЗУЕМ HELPER для генерации клавиатуры
+            const kbData = buildSubscriptionKeyboard(config, user.id);
+
+            if (kbData.channelLink) {
                 const template = (config.texts.sub_warning_text || DEFAULT_CONFIG.texts.sub_warning_text);
                 const updatedText = template
                   .replace('{user_mention}', getMention(user))
-                  .replace('{channel_link}', channelLink);
+                  .replace('{channel_link}', kbData.channelLink);
                 
-                const keyboard = {
-                    inline_keyboard: [
-                        [{ text: `📱 ${channelTitle.replace(/[<>]/g, '')}`, url: config.target_channel_url }],
-                        [{ text: "✅ Я подписался", callback_data: `check_sub_${user.id}` }]
-                    ]
-                };
-                
-                // ✅ ПРОВЕРЯЕМ: Изменился ли текст?
                 const currentText = String(callbackQuery.message.text || '');
                 
                 if (currentText !== updatedText) {
-                    // Редактируем ТОЛЬКО если текст отличается
                     const editResult = sendTelegram('editMessageText', {
                         chat_id: chat.id,
                         message_id: messageId,
                         text: updatedText,
                         parse_mode: 'HTML',
-                        reply_markup: JSON.stringify(keyboard),
+                        reply_markup: JSON.stringify(kbData.keyboard),
                         disable_web_page_preview: true
                     });
                     
                     if (!editResult?.ok) {
                         logToSheet('WARN', `[check_sub] Failed to edit message: ${editResult?.description}`);
                     }
-                } else {
-                    logToSheet('DEBUG', `[check_sub] Text already correct, no edit needed`);
                 }
                 
-                // ✅ АЛЕРТ: Показываем инструкцию всплывающим окном
-                const plainName = getMention(user).replace(/<[^>]*>/g, '');
-                const alertText = `🚫 Вы не подписаны на:\n"${String(channelTitle).replace(/[<>]/g, '')}"\n\nПожалуйста, подпишитесь и попробуйте ещё раз.`;
+                const alertText = `🚫 Вы не подписаны на:\n"${kbData.channelTitle}"\n\nПожалуйста, подпишитесь и попробуйте ещё раз.`;
                 
                 sendTelegram('answerCallbackQuery', { 
                     callback_query_id: callbackId, 
@@ -1245,20 +1294,14 @@ function handleMessage(message, services, config) {
         textLength: message.text ? message.text.length : 0
     });
     
-    // Если пользователь уже ограничен, не эскалируем
-    try {
-        const current = getChatMemberSafe(chat.id, user.id);
-        const until = current?.result?.until_date ? Number(current.result.until_date) : 0;
-        const nowSec = Math.floor(Date.now() / 1000);
-        const isRestricted = String(current?.result?.status || '') === 'restricted' || current?.result?.can_send_messages === false;
-        if (isRestricted && until > nowSec) {
-            try { deleteMessage(chat.id, message.message_id); } catch(_) {}
-            logEventTrace(config, 'message', 'restricted_user_message', 'Сообщение от ограниченного пользователя', {
-                chatId: chat.id, userId: user.id, until
-            });
-            return;
-        }
-    } catch(_) {}
+    // ♻️ ИСПОЛЬЗУЕМ HELPER для проверки restrict-статуса
+    if (isUserCurrentlyRestricted(chat.id, user.id)) {
+        try { deleteMessage(chat.id, message.message_id); } catch(_) {}
+        logEventTrace(config, 'message', 'restricted_user_message', 'Сообщение от ограниченного пользователя', {
+            chatId: chat.id, userId: user.id
+        });
+        return;
+    }
 
     // Проверка подписки
     const isMember = isUserSubscribed(user.id, config.target_channel_id);
@@ -1273,6 +1316,94 @@ function handleMessage(message, services, config) {
         });
         return;
     }
+
+    // ==================== ПРОВЕРКА РЕПОСТОВ ====================
+    if (config.forward_check_enabled) {
+        const isForward = !!(message.forward_from || message.forward_from_chat);
+        
+        if (isForward) {
+            logToSheet('DEBUG', `[handleMessage] Forward detected from user ${user.id}`);
+            
+            // Определяем источник репоста
+            let forwardSourceId = null;
+            if (message.forward_from_chat) {
+                forwardSourceId = String(message.forward_from_chat.id);
+            } else if (message.forward_from) {
+                forwardSourceId = String(message.forward_from.id);
+            }
+            
+            logToSheet('DEBUG', `[handleMessage] Forward source ID: ${forwardSourceId}`);
+            
+            // Проверяем, разрешён ли источник
+            const isWhitelistedSource = forwardSourceId && (
+                forwardSourceId === String(config.target_channel_id) || 
+                config.whitelist_ids.includes(forwardSourceId)
+            );
+            
+            if (!isWhitelistedSource) {
+                // Удаляем репост из неразрешённого источника
+                logToSheet('INFO', `[handleMessage] Deleting forward from unauthorized source. User: ${user.id}, Source: ${forwardSourceId}`);
+                
+                try {
+                    deleteMessage(chat.id, message.message_id);
+                } catch (error) {
+                    logToSheet('WARN', `[handleMessage] Failed to delete forward: ${error.message}`);
+                }
+                
+                logEventTrace(config, 'message', 'forward_deleted', 'Репост из неразрешённого источника удалён', {
+                    chatId: chat.id,
+                    userId: user.id,
+                    sourceId: forwardSourceId,
+                    messageId: message.message_id
+                });
+                
+                // Счётчик нарушений для репостов
+                let forwardViolationCount = Number(services.cache.get(`forward_violations_${user.id}`) || 0) + 1;
+                services.cache.put(`forward_violations_${user.id}`, forwardViolationCount, 21600); // 6 часов
+                
+                const forwardLimit = config.forward_violation_limit || 3;
+                
+                if (forwardViolationCount < forwardLimit) {
+                    // Первое/второе нарушение - только предупреждение
+                    if (forwardViolationCount === 1) {
+                        const warningText = (config.texts.forward_warning_text || DEFAULT_CONFIG.texts.forward_warning_text)
+                            .replace('{user_mention}', getMention(user));
+                        
+                        const sentWarning = sendTelegram('sendMessage', {
+                            chat_id: chat.id,
+                            text: warningText,
+                            parse_mode: 'HTML',
+                            disable_notification: true
+                        });
+                        
+                        if (sentWarning?.ok) {
+                            addMessageToCleaner(chat.id, sentWarning.result.message_id, config.warning_message_timeout_sec || 20, services);
+                            logEventTrace(config, 'message', 'forward_warning_sent', 'Отправлено предупреждение о репостах', {
+                                chatId: chat.id,
+                                userId: user.id,
+                                messageId: sentWarning.result.message_id,
+                                violationCount: forwardViolationCount
+                            });
+                        }
+                    }
+                } else {
+                    // Третье нарушение - прогрессивный мут
+                    applyProgressiveMuteForForwards(chat.id, user, services, config);
+                    services.cache.remove(`forward_violations_${user.id}`);
+                    logEventTrace(config, 'message', 'forward_mute_applied', 'Достигнут лимит нарушений репостов, применён мут', {
+                        chatId: chat.id,
+                        userId: user.id,
+                        violationLimit: forwardLimit
+                    });
+                }
+                
+                return; // Прерываем дальнейшую обработку
+            } else {
+                logToSheet('DEBUG', `[handleMessage] Forward from whitelisted source allowed. Source: ${forwardSourceId}`);
+            }
+        }
+    }
+    // ==================== КОНЕЦ ПРОВЕРКИ РЕПОСТОВ ====================
     // ✅ ИСПРАВЛЕНИЕ: НЕ ждём результата - запускаем асинхронно
     try {
         deleteMessage(chat.id, message.message_id);
@@ -1295,38 +1426,25 @@ function handleMessage(message, services, config) {
 
     if (violationCount < config.violation_limit) {
         if (violationCount === 1) {
+            // ♻️ ИСПОЛЬЗУЕМ HELPER для генерации клавиатуры
+            const kbData = buildSubscriptionKeyboard(config, user.id);
+            
             let text;
-            let keyboard;
-
-            if (config.target_channel_url && config.target_channel_url.trim() !== '') {
-                const channelInfo = sendTelegram('getChat', { chat_id: config.target_channel_id });
-                const channelTitle = channelInfo?.result?.title || config.target_channel_id;
-                const channelLink = `<a href="${config.target_channel_url}">${channelTitle.replace(/[<>]/g, '')}</a>`;
+            if (kbData.channelLink) {
                 const template = (config.texts.sub_warning_text || DEFAULT_CONFIG.texts.sub_warning_text);
                 text = template
                   .replace('{user_mention}', getMention(user))
-                  .replace('{channel_link}', channelLink);
-                keyboard = {
-                    inline_keyboard: [
-                        [{ text: `📱 ${channelTitle.replace(/[<>]/g, '')}`, url: config.target_channel_url }],
-                        [{ text: "✅ Я подписался", callback_data: `check_sub_${user.id}` }]
-                    ]
-                };
+                  .replace('{channel_link}', kbData.channelLink);
             } else {
                 text = (config.texts.sub_warning_text_no_link || DEFAULT_CONFIG.texts.sub_warning_text_no_link)
                   .replace('{user_mention}', getMention(user));
-                keyboard = {
-                    inline_keyboard: [
-                        [{ text: "✅ Я подписался", callback_data: `check_sub_${user.id}` }]
-                    ]
-                };
             }
 
             const sentWarning = sendTelegram('sendMessage', {
                 chat_id: chat.id,
                 text: text,
                 parse_mode: 'HTML',
-                reply_markup: JSON.stringify(keyboard),
+                reply_markup: JSON.stringify(kbData.keyboard),
                 disable_web_page_preview: true,
                 disable_notification: true
             });
@@ -1503,28 +1621,98 @@ function applyProgressiveMute(chatId, user, services, config) {
         const text = config.texts.sub_mute_text
             .replace('{user_mention}', getMention(user))
             .replace('{duration}', muteDurationMin);
+        
+        // ♻️ ИСПОЛЬЗУЕМ HELPER для генерации клавиатуры
+        const kbData = buildSubscriptionKeyboard(config, user.id);
         let keyboard = undefined;
-        if (config.target_channel_url && String(config.target_channel_url).trim() !== '') {
-            try {
-                const chInfo = sendTelegram('getChat', { chat_id: config.target_channel_id });
-                const title = chInfo?.result?.title || String(config.target_channel_id);
-                const link = `<a href="${config.target_channel_url}">${title.replace(/[<>]/g, '')}</a>`;
-                const warningTpl = (config.texts.sub_warning_text || DEFAULT_CONFIG.texts.sub_warning_text);
-                const extra = `\n\n` + warningTpl
-                  .replace('{user_mention}', getMention(user))
-                  .replace('{channel_link}', link);
-                text = text + extra;
-                keyboard = { inline_keyboard: [
-                  [{ text: `📱 ${title.replace(/[<>]/g, '')}`, url: config.target_channel_url }],
-                  [{ text: '✅ Я подписался', callback_data: `check_sub_${user.id}` }]
-                ] };
-            } catch(_) {}
+
+        if (kbData.channelLink) {
+            const warningTpl = (config.texts.sub_warning_text || DEFAULT_CONFIG.texts.sub_warning_text);
+            const extra = `\n\n` + warningTpl
+              .replace('{user_mention}', getMention(user))
+              .replace('{channel_link}', kbData.channelLink);
+            const fullText = text + extra;
+            keyboard = kbData.keyboard;
+            
+            const sentMuteMsg = sendTelegram('sendMessage', { chat_id: chatId, text: fullText, parse_mode: 'HTML', reply_markup: keyboard ? JSON.stringify(keyboard) : undefined, disable_web_page_preview: true });
+            if (sentMuteMsg?.ok) {
+                addMessageToCleaner(chatId, sentMuteMsg.result.message_id, 10, services);
+            }
+        } else {
+            const sentMuteMsg = sendTelegram('sendMessage', { chat_id: chatId, text: text, parse_mode: 'HTML', reply_markup: undefined, disable_web_page_preview: true });
+            if (sentMuteMsg?.ok) {
+                addMessageToCleaner(chatId, sentMuteMsg.result.message_id, 10, services);
+            }
+        }
+    } finally {
+        lock.releaseLock();
+    }
+}
+
+/**
+ * Применяет прогрессивный мут за нарушение правил репостов
+ * @param {string} chatId - ID чата
+ * @param {object} user - Объект пользователя
+ * @param {object} services - Объект сервисов (ss, cache, lock)
+ * @param {object} config - Объект конфигурации
+ */
+function applyProgressiveMuteForForwards(chatId, user, services, config) {
+    const lock = services.lock;
+    lock.waitLock(15000);
+    try {
+        const usersSheet = services.ss.getSheetByName('Users');
+        if (!usersSheet) return;
+
+        const userId = user.id;
+        const userData = findRow(usersSheet, userId, 1);
+        const currentLevel = userData ? Number(userData.row[1]) : 0;
+        const newLevel = currentLevel + 1;
+
+        let muteDurationMin;
+        if (newLevel === 1) {
+            muteDurationMin = config.mute_level_1_duration_min;
+        } else if (newLevel === 2) {
+            muteDurationMin = config.mute_level_2_duration_min;
+        } else {
+            muteDurationMin = config.mute_level_3_duration_min;
         }
 
-        const sentMuteMsg = sendTelegram('sendMessage', { chat_id: chatId, text: text, parse_mode: 'HTML', reply_markup: keyboard ? JSON.stringify(keyboard) : undefined, disable_web_page_preview: true });
+        const muteUntil = Math.floor(new Date().getTime() / 1000) + (muteDurationMin * 60);
+        const restrictResp = restrictUser(chatId, userId, false, muteUntil);
+        
+        try {
+            verifyAndLogChatMember(chatId, userId, 'forward_mute_verify');
+        } catch (e) {
+            logToSheet('WARN', `[applyProgressiveMuteForForwards] Verify restrict failed: ${e && e.message ? e.message : e}`);
+        }
+
+        if (userData) {
+            usersSheet.getRange(userData.rowIndex, 2).setValue(newLevel);
+        } else {
+            usersSheet.appendRow([userId, newLevel, new Date()]);
+        }
+
+        const text = (config.texts.forward_mute_text || DEFAULT_CONFIG.texts.forward_mute_text)
+            .replace('{user_mention}', getMention(user))
+            .replace('{duration}', muteDurationMin);
+
+        const sentMuteMsg = sendTelegram('sendMessage', { 
+            chat_id: chatId, 
+            text: text, 
+            parse_mode: 'HTML',
+            disable_web_page_preview: true 
+        });
+        
         if (sentMuteMsg?.ok) {
             addMessageToCleaner(chatId, sentMuteMsg.result.message_id, 10, services);
         }
+        
+        logEventTrace(config, 'forward', 'mute_applied', 'Применён прогрессивный мут за репосты', {
+            chatId,
+            userId,
+            level: newLevel,
+            durationMin: muteDurationMin
+        });
     } finally {
         lock.releaseLock();
     }
