@@ -13,6 +13,11 @@ This Google Apps Script creates a sophisticated, highly configurable Telegram bo
     -   **Automatic Passthrough for Target Channel**: Automatically ignores (never deletes) any posts from your main `target_channel_id`.
     -   **Whitelist for Other Channels**: Allows you to specify other channel IDs in the `Whitelist` sheet whose posts should also be ignored.
     -   Deletes posts from any other non-whitelisted channels.
+- **Advanced Repost Control**:
+    -   **Admin/Creator Immunity**: Reposts from administrators and channel creators are never deleted.
+    -   **Whitelisted Sources**: Reposts from whitelisted channels and users are automatically allowed.
+    -   **Progressive Punishment**: After 1-2 forbidden reposts: deletion + warning. After 3+ reposts: deletion + progressive mute (same system as subscription violations).
+    -   **Comprehensive Detection**: Handles all types of reposts (sender_chat, forward_from, forward_from_chat).
 - **Whitelist for Users**: A dedicated `Whitelist` sheet allows you to specify user IDs (e.g., other bots or trusted users) that the script should always ignore.
 - **Authorized Chats**: A crucial security feature. The bot will **only operate** in chat groups whose IDs are listed in the `authorized_chat_ids` setting.
 - **Smart CAPTCHA**: The CAPTCHA is triggered *only* on a real user join event, ignoring other status changes. It also won't be shown to joining administrators.

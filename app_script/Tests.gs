@@ -17,7 +17,12 @@ function runAllTests() {
       test_handleNewChatMember_CAPTCHA,
       test_handleMessage_ViolationCount,
       test_applyProgressiveMute_level1,
-      test_messageCleaner_deletesExpired
+      test_messageCleaner_deletesExpired,
+      test_checkRepost_allowedChannel,
+      test_checkRepost_forbiddenChannel,
+      test_checkRepost_allowedUser,
+      test_checkRepost_forbiddenUser,
+      test_handleMessage_repostViolation
   ];
   
   let passed = 0;
@@ -249,5 +254,109 @@ function test_messageCleaner_deletesExpired() {
     const updatedQueue = JSON.parse(services.properties.getProperty('deleteQueue'));
     assertEquals(1, updatedQueue.length, 'messageCleaner [queue length]');
     assertEquals(messageId2, updatedQueue[0].messageId, 'messageCleaner [remaining message]');
+}
+
+// =================================================================================
+// 5. REPOST TESTS
+// =================================================================================
+
+function test_checkRepost_allowedChannel() {
+    const config = { 
+        target_channel_id: TEST_CHANNEL_ID,
+        whitelist_ids: ['-100999888777']
+    };
+    
+    const message = {
+        sender_chat: { id: TEST_CHANNEL_ID, title: "Target Channel" }
+    };
+    
+    const result = checkRepost(message, config);
+    assertTrue(result.isRepost, 'test_checkRepost_allowedChannel [isRepost]');
+    assertTrue(result.allowed, 'test_checkRepost_allowedChannel [allowed]');
+    assertEquals('whitelisted_channel_' + TEST_CHANNEL_ID, result.source, 'test_checkRepost_allowedChannel [source]');
+}
+
+function test_checkRepost_forbiddenChannel() {
+    const config = { 
+        target_channel_id: TEST_CHANNEL_ID,
+        whitelist_ids: ['-100999888777']
+    };
+    
+    const message = {
+        sender_chat: { id: '-100555444333', title: "Forbidden Channel" }
+    };
+    
+    const result = checkRepost(message, config);
+    assertTrue(result.isRepost, 'test_checkRepost_forbiddenChannel [isRepost]');
+    assertTrue(!result.allowed, 'test_checkRepost_forbiddenChannel [allowed]');
+    assertEquals('channel_-100555444333', result.source, 'test_checkRepost_forbiddenChannel [source]');
+}
+
+function test_checkRepost_allowedUser() {
+    const config = { 
+        target_channel_id: TEST_CHANNEL_ID,
+        whitelist_ids: ['123456788']
+    };
+    
+    const message = {
+        forward_from: { id: 123456788, first_name: "Whitelisted User" }
+    };
+    
+    const result = checkRepost(message, config);
+    assertTrue(result.isRepost, 'test_checkRepost_allowedUser [isRepost]');
+    assertTrue(result.allowed, 'test_checkRepost_allowedUser [allowed]');
+    assertEquals('whitelisted_user_123456788', result.source, 'test_checkRepost_allowedUser [source]');
+}
+
+function test_checkRepost_forbiddenUser() {
+    const config = { 
+        target_channel_id: TEST_CHANNEL_ID,
+        whitelist_ids: ['123456788']
+    };
+    
+    const message = {
+        forward_from: { id: 999888777, first_name: "Forbidden User" }
+    };
+    
+    const result = checkRepost(message, config);
+    assertTrue(result.isRepost, 'test_checkRepost_forbiddenUser [isRepost]');
+    assertTrue(!result.allowed, 'test_checkRepost_forbiddenUser [allowed]');
+    assertEquals('user_999888777', result.source, 'test_checkRepost_forbiddenUser [source]');
+}
+
+function test_handleMessage_repostViolation() {
+    const mockSheet = new MockSheet([['key','value'],['target_channel_id', TEST_CHANNEL_ID], ['violation_limit', 3]]);
+    const services = getMockServices(mockSheet);
+    const config = { 
+        target_channel_id: TEST_CHANNEL_ID,
+        whitelist_ids: [],
+        violation_limit: 3,
+        warning_message_timeout_sec: 20,
+        texts: { repost_warning_text: "{user_mention}, репосты запрещены." }
+    };
+    services.cache.put('config', JSON.stringify(config), 300);
+    
+    const message = {
+        message_id: 666,
+        chat: { id: TEST_CHAT_ID },
+        from: { id: 777, is_bot: false, first_name: "Reposter" },
+        sender_chat: { id: '-100555444333', title: "Forbidden Channel" }
+    };
+    
+    // First repost violation - should delete and send warning
+    handleMessage(message, services, config);
+    
+    // Check that message was deleted
+    const deleteCall = MOCK_API_CALLS.find(c => c.method === 'deleteMessage');
+    assertTrue(deleteCall, 'test_handleMessage_repostViolation [delete call]');
+    assertEquals(666, deleteCall.payload.message_id, 'test_handleMessage_repostViolation [message_id]');
+    
+    // Check that warning was sent
+    const messageCall = MOCK_API_CALLS.find(c => c.method === 'sendMessage');
+    assertTrue(messageCall, 'test_handleMessage_repostViolation [warning call]');
+    assertTrue(messageCall.payload.text.includes('репосты запрещены'), 'test_handleMessage_repostViolation [warning text]');
+    
+    // Check violation count
+    assertEquals('1', services.cache.get(`repost_violations_777`), 'test_handleMessage_repostViolation [violation count]');
 }
 

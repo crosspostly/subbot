@@ -38,7 +38,9 @@ const DEFAULT_CONFIG = {
     sub_warning_text_no_link: "{user_mention}, чтобы отправлять сообщения в этот чат, вы должны быть подписаны на наш канал.",
     sub_success_text: "🎉 {user_mention}, вы успешно подписались и теперь можете писать сообщения!",
     sub_fail_text: "🚫 {user_mention}, не удалось подтвердить вашу подписку. Убедитесь, что подписаны на все каналы, и попробуйте снова.",
-    sub_mute_text: "{user_mention}, вы были временно ограничены в отправке сообщений на {duration} минут, так как не подписались на обязательные каналы."
+    sub_mute_text: "{user_mention}, вы были временно ограничены в отправке сообщений на {duration} минут, так как не подписались на обязательные каналы.",
+    repost_warning_text: "{user_mention}, репосты из неразрешённых источников запрещены. Пожалуйста, прекратите репостить.",
+    repost_mute_text: "{user_mention}, вы были временно ограничены в отправке сообщений на {duration} минут за многократные репосты из неразрешённых источников."
   }
 };
 
@@ -1230,6 +1232,43 @@ function handleCallbackQuery(callbackQuery, services, config) {
 }
 
 /**
+ * Проверяет является ли сообщение репостом и нужно ли его обрабатывать
+ * @param {object} message - Объект сообщения
+ * @param {object} config - Объект конфигурации
+ * @returns {object} - {isRepost: boolean, allowed: boolean, source: string}
+ */
+function checkRepost(message, config) {
+    // Проверяем репост из канала (sender_chat)
+    if (message.sender_chat) {
+        const senderId = String(message.sender_chat.id);
+        if (senderId === String(config.target_channel_id) || config.whitelist_ids.includes(senderId)) {
+            return { isRepost: true, allowed: true, source: `whitelisted_channel_${senderId}` };
+        }
+        return { isRepost: true, allowed: false, source: `channel_${senderId}` };
+    }
+    
+    // Проверяем репост от пользователя (forward_from)
+    if (message.forward_from) {
+        const forwardUserId = String(message.forward_from.id);
+        if (config.whitelist_ids.includes(forwardUserId)) {
+            return { isRepost: true, allowed: true, source: `whitelisted_user_${forwardUserId}` };
+        }
+        return { isRepost: true, allowed: false, source: `user_${forwardUserId}` };
+    }
+    
+    // Проверяем репост из канала (forward_from_chat)
+    if (message.forward_from_chat) {
+        const forwardChatId = String(message.forward_from_chat.id);
+        if (forwardChatId === String(config.target_channel_id) || config.whitelist_ids.includes(forwardChatId)) {
+            return { isRepost: true, allowed: true, source: `whitelisted_forward_channel_${forwardChatId}` };
+        }
+        return { isRepost: true, allowed: false, source: `forward_channel_${forwardChatId}` };
+    }
+    
+    return { isRepost: false, allowed: true, source: 'original' };
+}
+
+/**
  * ✅ ИСПРАВЛЕНИЕ #3: ОБРАБОТКА СООБЩЕНИЙ
  * Проверяет результат deleteMessage() и логирует успех/ошибку
  */
@@ -1259,6 +1298,88 @@ function handleMessage(message, services, config) {
             return;
         }
     } catch(_) {}
+    
+    // Проверка на репосты
+    const repostCheck = checkRepost(message, config);
+    logToSheet('DEBUG', `[handleMessage] Repost check for user ${user.id}: isRepost=${repostCheck.isRepost}, allowed=${repostCheck.allowed}, source=${repostCheck.source}`);
+    
+    if (repostCheck.isRepost) {
+        if (repostCheck.allowed) {
+            logToSheet('DEBUG', `[handleMessage] Allowed repost from ${repostCheck.source} by user ${user.id}`);
+            logEventTrace(config, 'message', 'allowed_repost', 'Разрешённый репост', {
+                chatId: chat.id,
+                userId: user.id,
+                source: repostCheck.source
+            });
+            return;
+        } else {
+            // Запрещённый репост - удаляем и применяем санкции
+            const deleteResult = deleteMessage(chat.id, message.message_id);
+            
+            let violationCount = Number(services.cache.get(`repost_violations_${user.id}`) || 0) + 1;
+            services.cache.put(`repost_violations_${user.id}`, violationCount, 21600);
+            
+            logEventTrace(config, 'message', 'repost_violation', 'Удалён запрещённый репост', {
+                chatId: chat.id,
+                userId: user.id,
+                messageId: message.message_id,
+                source: repostCheck.source,
+                deleteOk: deleteResult?.ok,
+                violationCount,
+                violationLimit: config.violation_limit
+            });
+            
+            if (violationCount < config.violation_limit) {
+                if (violationCount === 1 || violationCount === 2) {
+                    // Предупреждение за 1-2 репоста
+                    const text = (config.texts.repost_warning_text || DEFAULT_CONFIG.texts.repost_warning_text)
+                        .replace('{user_mention}', getMention(user));
+                    
+                    const sentWarning = sendTelegram('sendMessage', {
+                        chat_id: chat.id,
+                        text: text,
+                        parse_mode: 'HTML',
+                        disable_notification: true
+                    });
+                    
+                    if (sentWarning?.ok) {
+                        addMessageToCleaner(chat.id, sentWarning.result.message_id, config.warning_message_timeout_sec, services);
+                        logEventTrace(config, 'message', 'repost_warning_sent', 'Отправлено предупреждение о репостах', {
+                            chatId: chat.id,
+                            userId: user.id,
+                            messageId: sentWarning.result.message_id
+                        });
+                    }
+                }
+            } else {
+                // Прогрессивный мут за 3+ репостов
+                applyProgressiveMute(chat.id, user, services, config);
+                services.cache.remove(`repost_violations_${user.id}`);
+                
+                const muteText = (config.texts.repost_mute_text || DEFAULT_CONFIG.texts.repost_mute_text)
+                    .replace('{user_mention}', getMention(user))
+                    .replace('{duration}', getMuteDurationText(chat.id, user.id, services));
+                
+                const sentMuteMsg = sendTelegram('sendMessage', {
+                    chat_id: chat.id,
+                    text: muteText,
+                    parse_mode: 'HTML',
+                    disable_notification: true
+                });
+                
+                if (sentMuteMsg?.ok) {
+                    addMessageToCleaner(chat.id, sentMuteMsg.result.message_id, config.warning_message_timeout_sec, services);
+                }
+                
+                logEventTrace(config, 'message', 'repost_mute_applied', 'Применён мут за репосты', {
+                    chatId: chat.id,
+                    userId: user.id,
+                    violationLimit: config.violation_limit
+                });
+            }
+            return;
+        }
+    }
 
     // Проверка подписки
     const isMember = isUserSubscribed(user.id, config.target_channel_id);
@@ -1274,11 +1395,7 @@ function handleMessage(message, services, config) {
         return;
     }
     // ✅ ИСПРАВЛЕНИЕ: НЕ ждём результата - запускаем асинхронно
-    try {
-        deleteMessage(chat.id, message.message_id);
-    } catch(error) {
-        logToSheet('DEBUG', `[handleMessage] Delete async - будет в очередь`);
-    }
+    const deleteResult = deleteMessage(chat.id, message.message_id);
 
     logToSheet('DEBUG', `[handleMessage] Delete result: ok=${deleteResult?.ok}, error=${deleteResult?.description}`);
     
@@ -1455,6 +1572,31 @@ function isUserSubscribed(userId, channelId) {
     } catch (e) {
         logToSheet("ERROR", `Ошибка проверки подписки для user ${userId} в канале ${channelId}: ${e.message}`);
         return false;
+    }
+}
+
+/**
+ * Получает текст продолжительности мута для пользователя
+ * @param {string} chatId - ID чата
+ * @param {string|number} userId - ID пользователя
+ * @param {object} services - Объект сервисов
+ * @returns {string} - Текст продолжительности мута
+ */
+function getMuteDurationText(chatId, userId, services) {
+    try {
+        const usersSheet = services.ss.getSheetByName('Users');
+        if (!usersSheet) return 'некоторое время';
+        
+        const userData = findRow(usersSheet, userId, 1);
+        const currentLevel = userData ? Number(userData.row[1]) : 0;
+        
+        if (currentLevel === 1) return '1 час';
+        if (currentLevel === 2) return '1 день';
+        if (currentLevel >= 3) return '7 дней';
+        
+        return '30 минут';
+    } catch (e) {
+        return 'некоторое время';
     }
 }
 
